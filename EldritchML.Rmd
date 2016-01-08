@@ -1,0 +1,360 @@
+---
+title: "Using machine learning to build a model of Eldritch Horror outcomes"
+author: "Keith H. Turner (khturner@gmail.com, http://twitter.com/kay_aych)"
+date: "12/31/2015"
+output: html_document
+runtime: shiny
+---
+
+## Intro
+
+I love [Eldritch Horror](https://www.fantasyflightgames.com/en/products/eldritch-horror/). The flavor text is so evocative, the sense of accomplishment when you finally bury a mystery is so satisfying, and the dread you feel as the next Mythos card is revealed is just delicious. You really feel like the world of the game is out to get you. However, it does feel like sometimes it's out to get you more than other times, doesn't it? Sometimes you're just cruising through the world, snatching up clues and mysteries like it's merely a bump on the road to getting cool items. After our fourth win in a row, my game group and I started to wonder if we were doing something wrong, or if there were ways we could make the game more challenging.
+
+A member of my game group came across this great [Google Doc of Eldritch Horror outcomes](https://docs.google.com/spreadsheets/d/1ZdxFQZu-5jT9zyTRuE0JCFR4KmlRSMTx1G0bZntfdWA/edit#gid=3), and it got my data scientist wheels turning. The Doc has a lot of good summary statistics with some general guidelines to follow if you want to design an easier (Daisy, Ursula, Agnes, and George vs. Rise of the Elder Things on the Mountains of Madness sideboard) or a harder (Mark, Leo, Silas, Akachi, and Lily vs. Yig with the Forsaken Lore expansion) game. Though what really caught my eye was the last worksheet on the Doc - the raw data. I got to wondering - can machine learning find patterns in the data and build a more complete model of Eldritch Horror outcomes? Below, I'll walk through my investigations, but there are a few key take-home points that stood out to me.
+
+## Take-home points
+* The key factors in determining game difficulty are the team size and the Ancient One (check the Google Doc for guidelines there)
+* Most importantly, it is **hard** to predict the outcome of an Eldritch Horror game based on the setup, which I was pleased to find. After all, what fun is a game (or anything, for that matter!) where you have no agency, and the outcome is predetermined for you?
+
+## Interactive predictor
+You can find an interactive version of the final models at the [bottom of this page](#shinyapp).
+
+## Loading the data
+I decided to play with the data in my sandbox of choice, R. I tend to do everything in R with the amazing [dplyr](https://cran.r-project.org/web/packages/dplyr/index.html) package, so if you are not familiar with some of what I'm doing I'd recommend the excellent [intro vignette](https://cran.rstudio.com/web/packages/dplyr/vignettes/introduction.html). The first step is to get the game data in:
+
+```{r, warning = F, message = F}
+suppressPackageStartupMessages(require(dplyr))
+suppressPackageStartupMessages(require(googlesheets))
+# Read in the spreadsheet
+# Had to make a local copy that is "Published to the web", according to https://github.com/jennybc/googlesheets/issues/171
+games <- "https://docs.google.com/spreadsheets/d/1NsizCqWDOM3MHNgXuerPKnl03mmY9twhIZ8FKoUksuA/pubhtml" %>%
+  gs_url %>% gs_read("Submissions")
+# Let's take a look
+games
+
+```
+
+The data is a bit messy, and includes some variables that we're not interested in feeding into our model of game setup (game time for instance). Let's clean it up.
+
+```{r}
+# Tidy up columns with some entries are named differently
+games$Mythos.modification[which(games$Mythos.modification == "Only Easy used")] <- "Easy only"
+games$Mythos.modification[which(games$Mythos.modification == "Only Hard used")] <- "Hard only"
+games$Result[which(games$Result == "Defeat by Awakened Ancient One")] <- "Defeat by awakened Ancient One"
+games <- games %>%
+  # Factorize variables that should be factors
+  mutate(Ancient.One = factor(Ancient.One), Mythos.modification = factor(Mythos.modification),
+         Result = factor(Result), Team.Size = factor(Team.Size),
+         # Let's make a Win/Lose factor
+         Outcome = factor(gsub(" .*", "", Result)),
+         # Break out lists into boolean columns
+         Forsaken.Lore = grepl("Forsaken Lore", Expansions),
+         Mountains.of.Madness = grepl("Mountains of Madness", Expansions),
+         Strange.Remnants = grepl("Strange.Remnants", Expansions),
+         Prelude = grepl("Prelude", Options), Starting.rumor = grepl("Starting Rumor", Options)) %>% 
+  # Remove variables that we don't want in our model, and clean out those list variables
+  select(-Timestamp, -Nickname, -Options, -Expansions, -Special.Events, -Score, -Doom.track,
+         -Defeated, -Devoured, -Game.Length, -Epic.Monsters, -Rumors.Passed, -Rumors.Failed)
+# How's it look now?
+games
+```
+
+OK, that looks better. The things that should be factors are, and we are starting to build boolean features for binary choices (e.g. "should we use Forsaken Lore, yes or no?"). This is starting to feel like a well-behaved dataset. The only column left that needs a little TLC is Investigators. This is a tough one to model. Team balance can definitely impact the game, but there are far too many unique combinations of investigators to consider each group as a level in a factor:
+
+```{r}
+games %>% group_by(Investigators) %>% tally(sort = T)
+# I ain't got time for incomplete records!
+games <- games %>% filter(!is.na(Investigators))
+```
+
+2,739 different logged teams is a lot of levels for a factor, so clearly we need to distill this down somewhat. Let's do the dumbest thing first, make a boolean column for each investigator:
+
+```{r}
+all_investigators <- games$Investigators %>% strsplit(", ") %>%
+  unlist %>% factor %>% levels %>% gsub("\"", "", .)
+for (investigator in all_investigators) {
+  games[[investigator]] <- grepl(investigator, games$Investigators)
+}
+games <- games %>% select(-Investigators)
+games
+```
+
+Alright, this is starting to look good. Let's save our data so far and get to work!
+
+```{r}
+saveRDS(games, "EldritchData.rds.gz", compress = T)
+```
+
+## Model 0: You always lose
+Let's remove "Result" if we're going to build a model of "Outcome" (it's pretty easy to predict Victory or Defeat if you know you were Defeated by an awakened Ancient One)
+
+```{r}
+games <- games %>% select(-Result)
+```
+
+OK, to start, think of how you might begin to predict outcome based on setup. Let's start by assuming that this game is evil and you lose every time. How accurate are we?
+
+```{r}
+Prediction <- rep("Defeat?", nrow(games))
+# How accurate are we?
+table(Prediction, games$Outcome) %>% prop.table
+```
+
+OK, so the "you always lose" model is **49.2% accurate**, slightly worse than a coin flip. We can do better.
+
+## Model 1: Ancient One + team size
+We know from the Google Doc that some things, like the choice of Ancient One and team size, affect the game's difficulty. So let's have a look at that.
+
+```{r, warning = F}
+suppressPackageStartupMessages(require(reshape2))
+suppressPackageStartupMessages(require(ggplot2))
+suppressPackageStartupMessages(require(scales))
+games %>% group_by(Ancient.One, Outcome) %>% tally() %>% dcast(Ancient.One ~ Outcome, value.var = "n") %>%
+  group_by(Ancient.One) %>% summarize(Win.Pct = Victory / (Defeat + Victory), Num.Games = Defeat + Victory) %>%
+  ggplot(aes(Ancient.One, Win.Pct, fill = Num.Games)) + geom_bar(stat = "identity") + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + scale_y_continuous(labels = percent)
+```
+
+In this graph, the lighter colored bars are the Ancient Ones who are played more often. Turns out I'm not the only one who thinks Rise of the Elder Things is too easy! How about team size?
+
+```{r, warning = F}
+games %>% group_by(Team.Size, Outcome) %>% tally() %>% dcast(Team.Size ~ Outcome, value.var = "n") %>%
+  group_by(Team.Size) %>% summarize(Win.Pct = Victory / (Defeat + Victory), Num.Games = Defeat + Victory) %>%
+  ggplot(aes(Team.Size, Win.Pct, fill = Num.Games)) + geom_bar(stat = "identity") + theme_bw() +
+  scale_y_continuous(labels = percent)
+```
+
+The bar coloring is the same as before. Most people (us included) play as four, it turns out, which actually seems to make the game significantly easier. However, there's a drop from 4 to 5. This is probably because with more investigators, you have to deal with more gates, more monsters during monster surges, and there are several rumors and mysteries that make you do something a number of times equal to the number of investigators, so now you have to do more work too.
+
+Anyway, the point of all this was to come up with a better classifier than "you always lose". How about we assume that you'll lose the game if you play with 1, 2, 3, 5, or 6 investigators, or if you play against Azathoth, Cthulhu, or Yig (These are the bars in the two graphs above that are < 50% chance to win)?
+
+```{r}
+Prediction <- rep("Victory?", nrow(games))
+Prediction[which(games$Team.Size %in% c(1,2,3,5,6) | games$Ancient.One %in% c("Azathoth", "Cthulhu", "Yig"))] <-
+  "Defeat?"
+table(Prediction, games$Outcome) %>% prop.table %>% diag %>% sum
+```
+
+Better! Overall accuracy is **57.4%**, up from 50%. Not too shabby. Now let's tweak this further by looking at how different variables interact. For instance, Azathoth and Cthulhu are both pretty tough, but does the number of investigators affect win percentage differently for different Ancient Ones?
+
+```{r, warning = F}
+games %>% group_by(Ancient.One, Team.Size, Outcome) %>% tally() %>%
+  dcast(Ancient.One + Team.Size ~ Outcome, value.var = "n") %>% group_by(Ancient.One, Team.Size) %>%
+  summarize(Win.Pct = Victory / (Defeat + Victory), Num.Games = Defeat + Victory) %>%
+  ggplot(aes(Team.Size, Win.Pct, color = Num.Games)) + geom_point() + facet_wrap(~Ancient.One) + theme_bw() +
+  scale_y_continuous(labels = percent)
+```
+
+We're starting to get a little granular here, and there isn't necessarily enough data here to be super confident in our conclusions (only 4 games were reported as 5 investigators vs. Rise of the Elder Things, and only 1 is a win. Fluke? One bad Mythos card being swapped for a good one changes that from 25% to 50%). However, some things are interesting and seem to be a bit more robust - for instance, while Azathoth gets easier as you go from 5 to 6 investigators, Cthulhu actually gets **harder** with 6 investigators. So it's clear that a model that allows for interactions between variables could help us a bit. This is starting to sound a lot like a **decision tree**. Let's lean back and let the [rpart](https://cran.r-project.org/web/packages/rpart/index.html) package take a crack at it!
+
+```{r, warning = F, message = F}
+suppressPackageStartupMessages(require(rpart))
+dtree <- rpart(Outcome ~ Ancient.One + Team.Size, games)
+suppressPackageStartupMessages(require(rpart.plot))
+prp(dtree)
+```
+
+Cool! So the rpart package seems to have figured out that if you pick 4 or 8 investigators, you're more likely to win. If not, then as long as you pick an Ancient One that's not Azathoth, Cthulhu, Shub-Niggurath, Syzygy, or Yig, you're still more likely to win than lose. How accurate is this model?
+
+```{r}
+Prediction <- ifelse(predict(dtree, games)[,1] >= 0.5, "Defeat?", "Victory?")
+table(Prediction, games$Outcome) %>% prop.table %>% diag %>% sum
+```
+
+Not bad! About **62.2% accurate**, a ~5% bump over our model that doesn't allow interactions between variables. But what about that cool blip in Cthulhu difficulty we found? Or the shape of the Win.Pct vs. Team.Size curve for Ithaqua, that's super weird, maybe there's something there? Or how about all those other factors, like which investigators are in the team, and which expansions you play with, etc. Wouldn't more nodes to capture these special cases help? To make deeper trees, we're going to relax a few parameters, allowing for more nodes to be made.
+
+```{r}
+dtree <- rpart(Outcome ~ ., games, control = rpart.control(minsplit = 5, cp = 0.005)) # The '.' means vs. everything else
+prp(dtree)
+Prediction <- ifelse(predict(dtree, games)[,1] >= 0.5, "Defeat?", "Victory?")
+table(Prediction, games$Outcome) %>% prop.table %>% diag %>% sum
+```
+
+Another bump! We're now **64.1% accurate**. So far this is going great! Let's really open 'er up and build the most crazy deep decision tree to capture all of those little "nuggets of truth" as Trevor Stephens calls them.
+
+```{r}
+dtree <- rpart(Outcome ~ ., games, control = rpart.control(minsplit = 2, cp = 0))
+Prediction <- ifelse(predict(dtree, games)[,1] >= 0.5, "Defeat?", "Victory?")
+table(Prediction, games$Outcome) %>% prop.table %>% diag %>% sum
+```
+**96.67% accurate**! We are awesome.
+
+But wait, weren't we talking earlier about how some of this data is pretty noisy? Remember how 3 of the 4 games that were 5 investigators vs. Rise of the Elder Things were losses? Doesn't that seem weird? How good is our prediction model if we only train it to recognize blips? Or, put another way, how good would this model do on data it has never seen before? This is where we need to introduce some **cross-validation**, or withholding some data for model building and then testing our model on that data. We'll use the great [caret](http://topepo.github.io/caret/index.html) package to help us.
+
+```{r}
+suppressPackageStartupMessages(require(caret))
+set.seed(12345)
+trainIndex <- createDataPartition(games$Outcome, p = 0.8, list = F) # Set aside 20% of the data for testing
+games.train <- games %>% slice(trainIndex) # Train on 80% of the data
+games.test <- games %>% slice(-trainIndex) # Test on the remaining 20%
+dtree <- rpart(Outcome ~ ., games.train, control = rpart.control(minsplit = 2, cp = 0))
+Prediction <- ifelse(predict(dtree, games.test)[,1] >= 0.5, "Defeat?", "Victory?")
+# How accurate are we on our test data?
+table(Prediction, games.test$Outcome) %>% prop.table %>% diag %>% sum
+```
+
+Hm...now we're back down to **60%**, *worse* than we were before we even started looking into these little nooks and crannies! What's going on here is we're [overfitting](https://en.wikipedia.org/wiki/Overfitting) to our noisy data. This is a complex topic, but put simply it means that we built a model that does great on data it's already seen, and not good against new data. What if one of those 4 games where 5 investigators played against Rise of the Elder Things happened on a bad day for somebody? We might train our model to look for 5 vs. RotET, which would predict our data well, but chances are it's not as hard as the data would suggest to beat them, so a model trained on that would be less accurate for predicting future cases. So how can we use this general decision tree approach but avoid overfitting?
+
+## Model 2: Random forest classification model of Victory/Defeat
+The answer to this question is to use random forests to build our model. They're fast, they're easy, and they aren't as much of a black box as other ML algorithms. If you're new to random forests, I can't recommend [Trevor Stephens' series of blog posts on the Titanic dataset](http://trevorstephens.com/post/72916401642/titanic-getting-started-with-r) enough. Even if you are a complete data science novice, it's a great read and very easy to follow. He takes you through a series of models of surviving or perishing on the Titanic, from the naive "everyone dies" model, through a slightly more informed "women and children first" model, and finally does some pretty nifty feature engineering and algorithm tuning on random forests. I really enjoyed reading it and I bet you will too. Much of this workflow is cribbed from his work.
+
+Basically though, a random forest is an ensemble of (usually) hundreds of decision trees that are allowed to "vote" on the outcome to generate a prediction. Here I will steal an image from Trevor Stephens' blog post:
+
+![small ensemble](http://38.media.tumblr.com/c0b017febe3ebab0e977b25ed1f5dae0/tumblr_inline_mzmf78fK9J1s5wtly.png)
+
+So these are three decision trees meant to predict if a particular passenger on the Titanic lived or died. They start with a 62% chance of surviving (the overall survival rate), and modifies that based on three factors: ticket class, sex, and whether they got on the ship at Queenstown or Southampton. Then those three trees vote. From Trevor's blog:
+
+> Each of these trees make their classification decisions based on different variables. So let’s imagine a female passenger from Southampton who rode in first class. Tree one and two would vote that she survived, but tree three votes that she perishes. If we take a vote, it’s 2 to 1 in favour of her survival, so we would classify this passenger as a survivor.
+
+And just like above, with more nodes, we can start to capture interactions between variables. One additional nice thing about random forests is that they don't really suffer much when you add in uninformative variables. So the first thing we can do is just let it rip on our data!
+
+```{r}
+suppressPackageStartupMessages(require(randomForest))
+rf <- randomForest(Outcome ~ ., games.train, importance = T, type = "prob") 
+Prediction <- predict(rf, games.test)
+table(Prediction, games.test$Outcome) %>% prop.table %>% diag %>% sum
+```
+
+Whoa mama! **64.5% accuracy** on cross validation! This is starting to look a lot nicer. What's also nice about random forests is that you can bust one open and look at exactly what variables are influencing the outcome (because we set `importance=T`):
+
+```{r}
+varImp(rf) %>% add_rownames("Feature") %>% arrange(-Defeat)
+```
+
+This is essentially a measure of how informative each feature is when it's used as a split in the trees in our forest. Note that it is **not** a measure of whether you the choice to include Mark, or Charlie, or play Forsaken Lore will make it more or less likely that you will win - instead it is a measure of how consequential that choice will be on the outcome. Another thing I like to do with random forests is ask for the probabilistic information back (the `type="prob"` parameter above). Let's see whether it's more right when it's more sure of its call:
+
+```{r}
+Prediction <- predict(rf, games.test, type = "prob") %>% as.data.frame %>% tbl_df
+Prediction$Outcome <- games.test$Outcome
+Prediction %>% ggplot(aes(Victory, fill = Outcome, color = Outcome)) + geom_density(alpha = 0.5) + theme_bw() +
+  scale_x_continuous(labels = percent) + xlab("P(Victory)")
+```
+
+This is a density plot (think of it like a histogram). Interestingly, there's a pretty big overlap; the model can be wrong even when it's super sure one way or the other. This highlights one of the key points of my investigations: **Game setup does not predetermine game outcome in Eldritch Horror very well**. The rest is skill, luck, phase of the moon, or whatever else, which is part of what makes it such a great game.
+
+Finally, let's build that final model on all of our data:
+
+```{r}
+rf_outcome <- randomForest(Outcome ~ ., games, type = "prob")
+```
+
+## Model 2b: Random forest classification model of type of Victory or Defeat
+This isn't super complicated, we're basically going to replace Outcome (Victory/Defeat) with Result (Victory by slumber Mysteries, etc.) and repeat the process.
+
+```{r}
+games <- readRDS("EldritchData.rds.gz") %>% select(-Outcome)
+trainIndex <- createDataPartition(games$Result, p = 0.8, list = F) # Set aside 20% of the data for testing
+games.train <- games %>% slice(trainIndex) # Train on 80% of the data
+games.test <- games %>% slice(-trainIndex) # Test on the remaining 20%
+rf <- randomForest(Result ~ ., games.train, importance = T, type = "prob") 
+Prediction <- predict(rf, games.test)
+table(Prediction, games.test$Result) %>% prop.table %>% diag %>% sum
+```
+
+So at **50.2% accuracy here**, it's pretty clear that it's easier to predict whether you win or lose than how you win or lose. But that's still not too bad! Could be interesting to include; what if you're really dying to play a game where you win by Final Mystery? Let's see what features affect the prediction of the type of victory or defeat you get:
+
+```{r}
+suppressPackageStartupMessages(require(shiny))
+renderDataTable ({ varImp(rf) %>% add_rownames("Feature") })
+```
+
+Like above, we'll build the final model here.
+
+```{r}
+rf_result <- randomForest(Result ~ ., games, type = "prob")
+```
+
+## <a name="shinyapp"></a>Interactive demo
+What fun is building a model like this when you can't mess around with it? Here's a quick little Shiny app that lets you make up your own Eldritch setup and let the models tell you what's most likely to happen:
+
+```{r, echo = F}
+inputPanel(
+  selectInput("ancient.one", "Select Ancient One", levels(games$Ancient.One)),
+    selectizeInput("investigators", "Select Investigators", all_investigators, multiple = T),
+    checkboxInput("prelude", "Prelude Card?"),
+    checkboxInput("startingrumor", "Starting Rumor?"),
+    checkboxGroupInput("expansions", "Select Expansions",
+                       choices = c("Forsaken.Lore", "Mountains.of.Madness", "Strange.Remnants")),
+    selectInput("mythos", "Mythos modifications", levels(games$Mythos.modification), "None")
+)
+
+d <- reactive({
+  d <- data.frame(Ancient.One = factor(input$ancient.one, levels(games$Ancient.One)),
+                  Mythos.modification = factor(input$mythos, levels(games$Mythos.modification)),
+                  Team.Size = factor(length(input$investigators), levels(games$Team.Size)),
+                  Forsaken.Lore = "Forsaken.Lore" %in% input$expansions,
+                  Mountains.of.Madness = "Mountains.of.Madness" %in% input$expansions,
+                  Strange.Remnants = "Strange.Remnants" %in% input$expansions,
+                  Prelude = input$prelude,
+                  Starting.rumor = input$startingrumor)
+  for (investigator in all_investigators) {
+    d[[investigator]] <- investigator %in% input$investigators
+  }
+  d %>% tbl_df
+})
+
+renderPrint({
+    if (length(input$investigators) >= 1 && length(input$investigators) <= 8) {
+      Prediction <- predict(rf_outcome, d(), type = "prob")
+      data.frame(Probability = Prediction[1,])
+    }
+    else { "Select between 1 and 8 investigators" }
+  })
+
+renderPrint({
+    if (length(input$investigators) >= 1 && length(input$investigators) <= 8) {
+      Prediction <- predict(rf_result, d(), type = "prob")
+      data.frame(Probability = Prediction[1,])
+    }
+    else { "Select between 1 and 8 investigators" }
+  })
+```
+
+Here's the source code for the interface:
+
+```{r, eval = F}
+inputPanel(
+  selectInput("ancient.one", "Select Ancient One", levels(games$Ancient.One)),
+    selectizeInput("investigators", "Select Investigators", all_investigators, multiple = T),
+    checkboxInput("prelude", "Prelude Card?"),
+    checkboxInput("startingrumor", "Starting Rumor?"),
+    checkboxGroupInput("expansions", "Select Expansions",
+                       choices = c("Forsaken.Lore", "Mountains.of.Madness", "Strange.Remnants")),
+    selectInput("mythos", "Mythos modifications", levels(games$Mythos.modification), "None"),
+  submitButton("Submit!")
+)
+
+d <- reactive({
+  d <- data.frame(Ancient.One = factor(input$ancient.one, levels(games$Ancient.One)),
+                  Mythos.modification = factor(input$mythos, levels(games$Mythos.modification)),
+                  Team.Size = factor(length(input$investigators), levels(games$Team.Size)),
+                  Forsaken.Lore = "Forsaken.Lore" %in% input$expansions,
+                  Mountains.of.Madness = "Mountains.of.Madness" %in% input$expansions,
+                  Strange.Remnants = "Strange.Remnants" %in% input$expansions,
+                  Prelude = input$prelude,
+                  Starting.rumor = input$startingrumor)
+  for (investigator in all_investigators) {
+    d[[investigator]] <- investigator %in% input$investigators
+  }
+  d %>% tbl_df
+})
+
+renderPrint({
+    if (length(input$investigators) >= 1 && length(input$investigators) <= 8) {
+      Prediction <- predict(rf_outcome, d(), type = "prob")
+      data.frame(Probability = Prediction[1,])
+    }
+    else { "Select between 1 and 8 investigators" }
+  })
+
+renderPrint({
+    if (length(input$investigators) >= 1 && length(input$investigators) <= 8) {
+      Prediction <- predict(rf_result, d(), type = "prob")
+      data.frame(Probability = Prediction[1,])
+    }
+    else { "Select between 1 and 8 investigators" }
+  })
+```
+
+## Conclusions
+Well like I said above, it's hard to predict an Eldritch Horror outcome based on setup, which is a good thing in my book. I'd like to update this model with a few more composite features, like number of spellcasters/fighters/etc. These tend to give the model a little insight into which characters work best and why. I'll update this document with future improvements as I make them. Please feel free to send along comments or questions and thanks for reading!
